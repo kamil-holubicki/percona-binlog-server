@@ -132,6 +132,20 @@ public:
   void discard_incomplete_transaction_events();
   void flush_event_buffer();
 
+  // removes all binlog files with sequence number less than or equal to
+  // 'target' (which must be present in the storage and share the base name
+  // with the existing binlog records); the binlog index is atomically
+  // rewritten first, then the corresponding payload and metadata objects
+  // are removed; any failure to remove an individual object after the
+  // index has been committed is silently swallowed - the resulting
+  // leftover files will trip the constructor's validators on next
+  // startup, requiring manual cleanup (automated recovery is a phase-2
+  // follow-up); the returned vector contains the records that were
+  // removed (in the original order) so that the caller can build a
+  // response from them
+  [[nodiscard]] binlog_record_container
+  purge_up_to(const composite_binlog_name &target);
+
   [[nodiscard]] std::string
   get_binlog_uri(const composite_binlog_name &binlog_name) const;
 
@@ -158,6 +172,7 @@ private:
   ctime_timestamp_range incomplete_transaction_timestamps_{};
 
   void ensure_streaming_mode() const;
+  void ensure_purging_mode() const;
 
   [[nodiscard]] const binlog_record &
   get_current_binlog_record() const noexcept {

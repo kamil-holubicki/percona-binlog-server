@@ -37,7 +37,13 @@ public:
 
   [[nodiscard]] storage_object_name_container list_objects();
   [[nodiscard]] std::string get_object(std::string_view name);
+  // 'put_object' is an atomic overwrite: a concurrent / post-crash
+  // reader either sees the previous bytes in full or the new bytes in
+  // full, never a partial mix; backends fulfil this either natively
+  // (S3 'PutObject') or via an internal write-temp-then-rename
+  // (filesystem)
   void put_object(std::string_view name, util::const_byte_span content);
+  void remove_object(std::string_view name);
 
   [[nodiscard]] bool is_stream_open() const noexcept { return stream_open_; }
   [[nodiscard]] std::uint64_t
@@ -53,8 +59,11 @@ private:
 
   [[nodiscard]] virtual storage_object_name_container do_list_objects() = 0;
   [[nodiscard]] virtual std::string do_get_object(std::string_view name) = 0;
+  // overrides must guarantee atomic-overwrite semantics, see
+  // 'put_object' above
   virtual void do_put_object(std::string_view name,
                              util::const_byte_span content) = 0;
+  virtual void do_remove_object(std::string_view name) = 0;
 
   [[nodiscard]] virtual std::uint64_t
   do_open_stream(std::string_view name,

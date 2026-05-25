@@ -680,6 +680,12 @@ void s3_storage_backend::do_put_object(std::string_view name,
       {.bucket = bucket_, .object_path = get_object_path(name)}, content);
 }
 
+void s3_storage_backend::do_remove_object(
+    [[maybe_unused]] std::string_view name) {
+  util::exception_location().raise<std::logic_error>(
+      "remove_object is not supported on the S3 storage backend");
+}
+
 [[nodiscard]] std::uint64_t
 s3_storage_backend::do_open_stream(std::string_view name,
                                    storage_backend_open_stream_mode mode) {

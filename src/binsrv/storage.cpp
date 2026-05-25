@@ -33,6 +33,7 @@
 #include "binsrv/ctime_timestamp.hpp"
 #include "binsrv/replication_mode_type.hpp"
 #include "binsrv/storage_backend_factory.hpp"
+#include "binsrv/storage_backend_type.hpp"
 #include "binsrv/storage_config.hpp"
 #include "binsrv/storage_metadata.hpp"
 
@@ -51,6 +52,13 @@ storage::storage(const storage_config &config,
                  replication_mode_type replication_mode)
     : construction_mode_{construction_mode}, backend_{},
       replication_mode_{replication_mode} {
+  if (construction_mode_ == storage_construction_mode_type::purging &&
+      config.get<"backend">() != storage_backend_type::file) {
+    util::exception_location().raise<std::runtime_error>(
+        "purge_up_to is only supported on the local filesystem storage "
+        "backend");
+  }
+
   const auto &checkpoint_size_opt{config.get<"checkpoint_size">()};
   if (checkpoint_size_opt.has_value()) {
     checkpoint_size_bytes_ = checkpoint_size_opt->get_value();
@@ -112,6 +120,22 @@ storage::storage(const storage_config &config,
   }
   load_binlog_index();
   validate_binlog_index(storage_objects);
+
+  // when the binlog index is empty (storage was fully purged via
+  // 'purge_up_to' of the last remaining file) there is nothing else to do
+  // at construction time; 'validate_binlog_index' has already ensured no
+  // payload leftovers, but the metadata-extras check normally happens
+  // inside 'load_and_validate_binlog_metadata_set', so it has to be done
+  // explicitly here before the early return
+  if (binlog_records_.empty()) {
+    assert(storage_objects.empty());
+    if (!storage_metadata_objects.empty()) {
+      util::exception_location().raise<std::logic_error>(
+          "storage contains binlog metadata files but the binlog index is "
+          "empty");
+    }
+    return;
+  }
 
   load_and_validate_binlog_metadata_set(storage_objects,
                                         storage_metadata_objects);
@@ -313,6 +337,87 @@ void storage::flush_event_buffer() {
   }
 }
 
+[[nodiscard]] storage::binlog_record_container
+storage::purge_up_to(const composite_binlog_name &target) {
+  ensure_purging_mode();
+
+  if (is_empty()) {
+    util::exception_location().raise<std::runtime_error>(
+        "cannot purge: binlog storage is empty");
+  }
+  const auto &front_base_name{binlog_records_.front().name.get_base_name()};
+  if (target.get_base_name() != front_base_name) {
+    util::exception_location().raise<std::runtime_error>(
+        "cannot purge: target binlog name has a different base name than "
+        "the binlog records in the storage");
+  }
+  const auto target_it{std::ranges::find(std::as_const(binlog_records_), target,
+                                         &binlog_record::name)};
+  if (target_it == std::cend(binlog_records_)) {
+    util::exception_location().raise<std::runtime_error>(
+        "cannot purge: target binlog name is not present in the storage");
+  }
+
+  // step 1: extract the prefix [begin, target_it + 1) - this becomes the
+  // set of records we are going to drop on disk; the returned vector
+  // preserves the original order so the caller can use it directly to
+  // produce a response
+  const auto victim_count{static_cast<std::size_t>(
+      std::distance(std::cbegin(binlog_records_), target_it) + 1)};
+  binlog_record_container removed_records;
+  removed_records.reserve(victim_count);
+  std::move(std::begin(binlog_records_),
+            std::begin(binlog_records_) +
+                static_cast<std::ptrdiff_t>(victim_count),
+            std::back_inserter(removed_records));
+  binlog_records_.erase(std::begin(binlog_records_),
+                        std::begin(binlog_records_) +
+                            static_cast<std::ptrdiff_t>(victim_count));
+
+  // step 2: rewrite the binlog index to the new (possibly empty)
+  // content; 'save_binlog_index' goes through the backend's
+  // atomic-overwrite 'put_object', so from this point on the purge is
+  // considered committed - any subsequent failure leaves the storage
+  // in an inconsistent state (leftover payload / metadata files no
+  // longer referenced by the index) that the constructor's existing
+  // validators will refuse to open on next startup; automated
+  // recovery is a phase-2 follow-up
+  save_binlog_index();
+
+  // step 3: best-effort removal of the victim payload + metadata
+  // objects; any failure here is intentionally swallowed - the index
+  // has already been committed and reporting a "file could not be
+  // removed" error to the caller would falsely suggest that the
+  // purge itself failed; the resulting leftovers will trip the
+  // constructor's validators on next startup
+  for (const auto &victim : removed_records) {
+    try {
+      backend_->remove_object(generate_binlog_metadata_name(victim.name));
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+    try {
+      backend_->remove_object(victim.name.str());
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+  }
+
+  // step 4: keep in-memory 'purged_gtids_' consistent with the new
+  // front so that any future call on this storage instance sees a
+  // coherent view (a future startup independently derives
+  // 'purged_gtids_' from the new front record's metadata)
+  if (is_in_gtid_replication_mode()) {
+    if (binlog_records_.empty()) {
+      purged_gtids_.clear();
+    } else {
+      const auto &front_added{binlog_records_.front().added_gtids};
+      purged_gtids_ =
+          front_added.has_value() ? *front_added : gtids::gtid_set{};
+    }
+  }
+
+  return removed_records;
+}
+
 [[nodiscard]] std::string
 storage::get_binlog_uri(const composite_binlog_name &binlog_name) const {
   return backend_->get_object_uri(binlog_name.str());
@@ -322,6 +427,13 @@ void storage::ensure_streaming_mode() const {
   if (construction_mode_ != storage_construction_mode_type::streaming) {
     util::exception_location().raise<std::logic_error>(
         "operation requires storage to be constructed in streaming mode");
+  }
+}
+
+void storage::ensure_purging_mode() const {
+  if (construction_mode_ != storage_construction_mode_type::purging) {
+    util::exception_location().raise<std::logic_error>(
+        "operation requires storage to be constructed in purging mode");
   }
 }
 
@@ -438,6 +550,9 @@ void storage::save_binlog_index() const {
     oss << binlog_path.generic_string() << '\n';
   }
   const auto content{oss.str()};
+  // 'put_object' is contractually atomic-overwrite, so any reader (or the
+  // next-startup constructor) sees either the previous index content or
+  // the new content in full, never a partial write
   backend_->put_object(default_binlog_index_name,
                        util::as_const_byte_span(content));
 }

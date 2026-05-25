@@ -22,7 +22,8 @@ namespace binsrv {
 
 enum class storage_construction_mode_type : std::uint8_t {
   querying_only,
-  streaming
+  streaming,
+  purging
 };
 
 enum class open_binlog_status : std::uint8_t {

@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include <boost/url/host_type.hpp>
 #include <boost/url/parse.hpp>
@@ -36,6 +37,15 @@
 #include "util/exception_location_helpers.hpp"
 
 namespace binsrv {
+
+namespace {
+// suffix appended to the object name when writing the temporary file
+// used by the atomic-overwrite implementation of 'do_put_object'; a
+// deterministic name keeps cleanup-on-startup trivial - any stale
+// '<name>.tmp' left by a crashed put is simply overwritten by the
+// next legitimate put for the same name
+constexpr std::string_view tmp_object_suffix{".tmp"};
+} // namespace
 
 filesystem_storage_backend::filesystem_storage_backend(
     const storage_config &config)
@@ -138,22 +148,64 @@ filesystem_storage_backend::do_get_object(std::string_view name) {
 
 void filesystem_storage_backend::do_put_object(std::string_view name,
                                                util::const_byte_span content) {
+  // atomic-overwrite is implemented via the standard POSIX
+  // write-temp-then-rename idiom: a crash mid-write leaves only the
+  // (deterministically-named) '<name>.tmp', never a truncated '<name>';
+  // a subsequent legitimate put for the same name simply truncates and
+  // overwrites the stale tmp before the rename
   const auto object_path = get_object_path(name);
+  auto tmp_object_path = object_path;
+  tmp_object_path += tmp_object_suffix;
+
   // opening in binary mode with truncating
   std::ofstream object_ofs{};
   object_ofs.rdbuf()->pubsetbuf(nullptr, 0U);
-  object_ofs.open(object_path, std::ios_base::out | std::ios_base::binary |
-                                   std::ios_base::trunc);
+  object_ofs.open(tmp_object_path, std::ios_base::out | std::ios_base::binary |
+                                       std::ios_base::trunc);
   if (!object_ofs.is_open()) {
     util::exception_location().raise<std::runtime_error>(
-        "cannot open underlying object file for writing");
+        "cannot open underlying tmp object file for writing");
   }
   const auto content_sv = util::as_string_view(content);
   if (!object_ofs.write(std::data(content_sv),
                         static_cast<std::streamoff>(std::size(content_sv)))) {
     util::exception_location().raise<std::runtime_error>(
-        "cannot write date to underlying object file");
+        "cannot write data to underlying tmp object file");
   }
+  // explicit close so a failed flush surfaces before the rename
+  object_ofs.close();
+  if (object_ofs.fail()) {
+    util::exception_location().raise<std::runtime_error>(
+        "cannot close underlying tmp object file");
+  }
+
+  std::error_code rename_ec;
+  // std::filesystem::rename() with std::error_code overload is noexcept;
+  // on POSIX it maps to rename(2), which is atomic within a single
+  // directory - readers see either the previous '<name>' content or the
+  // new content, never a partial state
+  std::filesystem::rename(tmp_object_path, object_path, rename_ec);
+  if (rename_ec) {
+    util::exception_location().raise<std::runtime_error>(
+        "cannot rename underlying tmp object file: " + rename_ec.message());
+  }
+  // TODO: fsync the parent directory to make the rename durable
+}
+
+void filesystem_storage_backend::do_remove_object(std::string_view name) {
+  const auto object_path = get_object_path(name);
+  std::error_code remove_ec;
+  // intentionally using non-throwing overload to handle the "file does not
+  // exist" case explicitly below
+  if (!std::filesystem::remove(object_path, remove_ec)) {
+    if (remove_ec) {
+      util::exception_location().raise<std::runtime_error>(
+          "cannot remove underlying object file: " + remove_ec.message());
+    }
+    util::exception_location().raise<std::runtime_error>(
+        "cannot remove underlying object file: file does not exist");
+  }
+  // TODO: fsync the parent directory to make the unlink durable
 }
 
 [[nodiscard]] std::uint64_t filesystem_storage_backend::do_open_stream(

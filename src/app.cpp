@@ -123,6 +123,7 @@ check_cmd_args(const util::command_line_arg_view &cmd_args,
     return true;
   case binsrv::operation_mode_type::search_by_timestamp:
   case binsrv::operation_mode_type::search_by_gtid_set:
+  case binsrv::operation_mode_type::purge_up_to:
     if (number_of_cmd_args !=
         expected_number_of_cmd_args_with_config_and_value) {
       return false;
@@ -1038,6 +1039,48 @@ bool handle_search_by_timestamp(std::string_view config_file_path,
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+bool handle_purge_up_to(std::string_view config_file_path,
+                        std::string_view subcommand_value) {
+  bool operation_successful{false};
+  std::string result;
+
+  try {
+    const auto target_name{
+        binsrv::composite_binlog_name::parse(subcommand_value)};
+
+    const binsrv::main_config config{config_file_path};
+    const auto &storage_config = config.root().get<"storage">();
+    const auto &replication_config = config.root().get<"replication">();
+    const auto replication_mode{replication_config.get<"mode">()};
+
+    // for now, only file backend supported
+    if (storage_config.get<"backend">() != binsrv::storage_backend_type::file) {
+      throw std::runtime_error(
+          "purge_up_to is only supported on the local filesystem storage "
+          "backend");
+    }
+
+    binsrv::storage storage{storage_config,
+                            binsrv::storage_construction_mode_type::purging,
+                            replication_mode};
+
+    const auto removed_records{storage.purge_up_to(target_name)};
+
+    binsrv::models::search_response response;
+    for (const auto &record : removed_records) {
+      append_record_to_response(response, storage, record);
+    }
+    result = response.str();
+    operation_successful = true;
+  } catch (const std::exception &e) {
+    const binsrv::models::error_response response{e.what()};
+    result = response.str();
+  }
+  std::cout << result << '\n';
+  return operation_successful;
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 bool handle_search_by_gtid_set(std::string_view config_file_path,
                                std::string_view subcommand_value) {
   bool operation_successful{false};
@@ -1109,6 +1152,8 @@ dispatch_stateless_command(binsrv::operation_mode_type operation_mode,
     return handle_search_by_timestamp(config_file_path, subcommand_value);
   case binsrv::operation_mode_type::search_by_gtid_set:
     return handle_search_by_gtid_set(config_file_path, subcommand_value);
+  case binsrv::operation_mode_type::purge_up_to:
+    return handle_purge_up_to(config_file_path, subcommand_value);
   default:
     return std::nullopt;
   }
@@ -1146,6 +1191,8 @@ int main(int argc, char *argv[]) {
               << " search_by_timestamp <json_config_file> <timestamp>\n"
               << "       " << executable_name
               << " search_by_gtid_set <json_config_file> <gtid_set>\n"
+              << "       " << executable_name
+              << " purge_up_to <json_config_file> <binlog_name>\n"
               << "       " << executable_name << " version\n";
     return EXIT_FAILURE;
   }

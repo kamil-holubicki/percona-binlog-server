@@ -40,6 +40,10 @@ void basic_storage_backend::put_object(std::string_view name,
   do_put_object(name, content);
 }
 
+void basic_storage_backend::remove_object(std::string_view name) {
+  do_remove_object(name);
+}
+
 [[nodiscard]] std::uint64_t
 basic_storage_backend::open_stream(std::string_view name,
                                    storage_backend_open_stream_mode mode) {
